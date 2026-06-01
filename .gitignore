@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 默认保存目录中的数据文件（保留 .gitkeep）
+data/*.png
+data/*.npy
+data/*.json
