@@ -1,16 +1,27 @@
 # RealSense RGB-D 采集工具
 
-基于 PyQt5 的 Intel RealSense 相机 RGB-D 数据采集 GUI 工具，支持实时预览、参数调节和本地保存。
+基于 PyQt5 的 Intel RealSense 相机 RGB-D 数据采集 GUI 工具，支持实时预览、参数调节、标定拍摄和点云融合。
 
 ## 功能
 
+### 采集页
 - 实时显示 RGB / Raw Depth / Aligned Depth 三路画面
 - 支持分辨率和帧率调节（通过下拉框选择）
-- 一键保存当前帧：RGB PNG + Depth colormap PNG + Depth uint16 NPY + Meta JSON
+- 保存内容可勾选：RGB PNG、深度图 PNG、深度 NPY、元数据 JSON
+- 一键保存当前帧，文件名前缀自定义，冲突自动追加时间戳
 - 自动对齐深度图到彩色图（`rs.align`）
-- 文件名前缀自定义，冲突自动追加时间戳
 - 完整的相机内参记录（color / depth / aligned_depth intrinsics）
-- 日志区显示启动状态、配置、保存路径和错误信息
+
+### 标定页
+- Charuco 标定板参数可配置（棋盘格行列数、方格/标记边长、ArUco 字典）
+- 实时 RGB + Aligned Depth 预览
+- 拍摄当前帧并自动进行 Charuco 角点检测与位姿估计（PnP）
+- 采集列表管理：查看检测叠加、删除、批量保存
+- 保存内容：RGB 图、深度图、深度 NPY、位姿 JSON、检测可视化图
+
+### 融合页
+- 基于 TSDF 的点云融合（多帧累积）
+- 体素下采样、距离过滤、跳像素采样等参数可调
 
 ## 环境要求
 
@@ -37,24 +48,42 @@ python main.py
 | 包 | 用途 |
 |---|---|
 | `pyrealsense2` | Intel RealSense SDK 的 Python 绑定 |
-| `opencv-python` | 图像处理、colormap、保存 PNG |
+| `opencv-python` | 图像处理、ArUco 检测、colormap、保存 PNG |
 | `numpy` | 深度数据存储（.npy） |
 | `PyQt5` | GUI 界面 |
+| `open3d` | 点云处理与 TSDF 融合（融合页需要） |
 
 ## UI 操作流程
 
+### 采集
 1. 启动程序：`python main.py`
-2. 在顶部控制区选择 RGB 分辨率、Depth 分辨率和 FPS
-3. 点击「启动相机」——三路画面开始实时刷新
-4. 点击「选择保存目录」指定数据存储位置（默认为 `./data/`）
-5. 在「文件名前缀」输入框中输入命名（如 `object_001`），留空则自动使用时间戳
+2. 在「采集」页顶部控制区选择 RGB 分辨率、Depth 分辨率和 FPS
+3. 勾选需要保存的内容项
+4. 点击「启动相机」——三路画面开始实时刷新
+5. 点击「选择保存目录」指定数据存储位置（默认为 `./data/`）
 6. 点击「保存当前帧」保存当前画面
 7. 点击「停止相机」释放设备
-8. 关闭窗口时自动停止相机
+
+### 标定
+1. 切换到「标定」页，配置 Charuco 板参数
+2. 点击「启动相机」，确认 RGB 和 Depth 预览正常
+3. 将标定板置于相机视野中，点击「拍摄当前帧」
+4. 系统自动检测角点并估计位姿，结果显示在右侧位姿面板
+5. 从多个角度重复拍摄（建议 15-30 张）
+6. 在采集列表中可选中记录查看检测叠加图
+7. 点击「保存全部」将采集数据批量导出
+
+### 融合
+1. 切换到「融合」页
+2. 加载多帧 RGB-D 数据
+3. 调整体素大小、距离阈值等参数
+4. 执行 TSDF 融合生成点云
 
 ## 保存的数据格式
 
-每次保存生成以下文件（以 `object_001` 为例）：
+### 采集页保存
+
+每次保存生成以下文件（以 `object_001` 为例，按勾选内容生成）：
 
 | 文件 | 格式 | 说明 |
 |---|---|---|
@@ -64,6 +93,18 @@ python main.py
 | `object_001_depth_raw.npy` | NPY | 原始深度 uint16 数据 |
 | `object_001_depth_aligned.npy` | NPY | 对齐后深度 uint16 数据 |
 | `object_001_meta.json` | JSON | 相机内参、depth_scale、分辨率、保存时间等 |
+
+### 标定页保存
+
+每次标定拍摄保存到 `calib_XXX_<timestamp>/` 子目录：
+
+| 文件 | 格式 | 说明 |
+|---|---|---|
+| `rgb.png` | PNG | 彩色图像 |
+| `depth_aligned.png` | PNG | 对齐后深度 colormap 图 |
+| `depth_aligned.npy` | NPY | 对齐后深度 uint16 数据 |
+| `pose.json` | JSON | 位姿估计结果（rvec/tvec/重投影误差） |
+| `rgb_detection.png` | PNG | 带角点检测叠加的可视化图（仅成功时） |
 
 **注意**：深度值单位 = uint16 像素值 × `depth_scale`（通常约 0.001m = 1mm），`depth_scale` 记录在 meta.json 中。
 
@@ -96,19 +137,23 @@ python main.py
 realsense_ui/
 ├── README.md
 ├── requirements.txt
-├── main.py                  # 程序入口
-├── config.py                # 默认配置常量
+├── main.py                      # 程序入口
+├── config.py                    # 默认配置常量
 ├── camera/
 │   ├── __init__.py
-│   └── realsense_camera.py  # RealSense 相机封装类
+│   └── realsense_camera.py      # RealSense 相机封装类
 ├── ui/
 │   ├── __init__.py
-│   └── main_window.py       # PyQt5 主窗口 UI
+│   ├── main_window.py           # PyQt5 主窗口（采集页 + 标签页容器）
+│   ├── calibration_tab.py       # 标定页（Charuco 检测 + 位姿估计）
+│   └── fusion_tab.py            # 融合页（TSDF 点云融合）
 ├── utils/
 │   ├── __init__.py
-│   ├── image_utils.py       # 图像转换工具
-│   └── save_utils.py        # 数据保存工具
-└── data/                    # 默认保存目录
+│   ├── image_utils.py           # 图像转换工具
+│   ├── save_utils.py            # 数据保存工具
+│   ├── calibration_utils.py     # Charuco 检测与位姿估计
+│   └── fusion_utils.py          # TSDF 融合算法
+└── data/                        # 默认保存目录
     └── .gitkeep
 ```
 
@@ -162,3 +207,9 @@ realsense_ui/
 - 确认当前在 `py_envs` conda 环境下
 - 运行 `pip show pyrealsense2` 检查是否已安装
 - 如果在 Windows 上 pip 无法安装，请先安装 Intel RealSense SDK（见问题 2）
+
+### 7. 标定拍摄后预览卡住
+
+- 拍摄完成后实时预览应继续运行
+- 位姿结果显示在右侧文本区，不会影响画面刷新
+- 如需查看某条采集的检测叠加图，在列表中点击对应行即可

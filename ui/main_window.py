@@ -10,9 +10,9 @@ import logging
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QLabel, QPushButton, QComboBox,
+    QMainWindow, QWidget, QLabel, QPushButton, QComboBox, QCheckBox,
     QLineEdit, QTextEdit, QFileDialog, QHBoxLayout, QVBoxLayout,
-    QGridLayout, QGroupBox, QSplitter, QMessageBox,
+    QGridLayout, QGroupBox, QSplitter, QMessageBox, QTabWidget,
 )
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QPixmap, QFont
@@ -20,6 +20,8 @@ from PyQt5.QtGui import QPixmap, QFont
 from camera import RealSenseCamera, RealSenseCameraError
 from utils.image_utils import cv_image_to_qpixmap, resize_for_display
 from utils.save_utils import save_frame_data
+from ui.calibration_tab import CalibrationTab
+from ui.fusion_tab import FusionTab
 import config
 
 logger = logging.getLogger(__name__)
@@ -58,11 +60,40 @@ class MainWindow(QMainWindow):
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(8, 8, 8, 8)
 
-        # --- 控制区 ---
-        root_layout.addWidget(self._create_control_panel())
+        # --- 标签页 ---
+        self.tabs = QTabWidget()
 
-        # --- 图像区 ---
-        root_layout.addWidget(self._create_image_panel(), stretch=1)
+        # 采集页
+        self.capture_tab = QWidget()
+        cap_layout = QVBoxLayout(self.capture_tab)
+        cap_layout.setContentsMargins(4, 4, 4, 4)
+        cap_layout.addWidget(self._create_control_panel())
+        cap_layout.addWidget(self._create_image_panel(), stretch=1)
+
+        self.tabs.addTab(self.capture_tab, "采集")
+
+        # 标定页
+        self.calib_tab = CalibrationTab(
+            get_camera=lambda: self.camera,
+            get_camera_running=lambda: (
+                self.camera is not None and self.camera.is_running()
+            ),
+            start_camera_cb=self._on_start,
+            stop_camera_cb=self._on_stop,
+            get_frames=lambda: self._current_frames,
+            get_intrinsics=lambda: (
+                self.camera.get_intrinsics() if self.camera else None
+            ),
+            log_func=self._log,
+        )
+
+        self.tabs.addTab(self.calib_tab, "标定")
+
+        # 融合页
+        self.fusion_tab = FusionTab(log_func=self._log)
+        self.tabs.addTab(self.fusion_tab, "融合")
+
+        root_layout.addWidget(self.tabs)
 
         # --- 日志区 ---
         root_layout.addWidget(self._create_log_panel())
@@ -131,6 +162,31 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self._on_save)
         self.btn_save.setEnabled(False)
         layout.addWidget(self.btn_save, 3, 4, 1, 2)
+
+        # 保存项复选框
+        layout.addWidget(QLabel("保存内容:"), 4, 0)
+
+        self._save_checkboxes = {}
+        save_row = QHBoxLayout()
+        for key in config.SAVE_ITEM_LABELS:
+            cb = QCheckBox(config.SAVE_ITEM_LABELS[key])
+            cb.setChecked(config.DEFAULT_SAVE_OPTIONS.get(key, True))
+            self._save_checkboxes[key] = cb
+            save_row.addWidget(cb)
+        layout.addLayout(save_row, 4, 1, 1, 5)
+
+        # 全选 / 取消全选
+        select_row = QHBoxLayout()
+        btn_select_all = QPushButton("全选")
+        btn_select_all.clicked.connect(self._on_select_all_save)
+        select_row.addWidget(btn_select_all)
+
+        btn_deselect_all = QPushButton("取消全选")
+        btn_deselect_all.clicked.connect(self._on_deselect_all_save)
+        select_row.addWidget(btn_deselect_all)
+
+        select_row.addStretch()
+        layout.addLayout(select_row, 5, 1, 1, 5)
 
         return group
 
@@ -232,6 +288,7 @@ class MainWindow(QMainWindow):
             )
             self.timer.start(33)  # ~30 fps 刷新
             self._update_ui_state(running=True)
+            self.calib_tab.notify_camera_started()
         except RealSenseCameraError as e:
             self._log(f"[ERROR] 相机启动失败: {e}")
             QMessageBox.warning(
@@ -248,6 +305,7 @@ class MainWindow(QMainWindow):
         self._current_frames = None
         self._clear_images()
         self._update_ui_state(running=False)
+        self.calib_tab.notify_camera_stopped()
 
     def _update_ui_state(self, running: bool):
         self.btn_start.setEnabled(not running)
@@ -321,6 +379,12 @@ class MainWindow(QMainWindow):
 
         prefix = self.edit_prefix.text().strip()
 
+        # 读取用户选择的保存项
+        save_options = self._get_save_options()
+        if not any(save_options.values()):
+            QMessageBox.warning(self, "警告", "请至少选择一项保存内容。")
+            return
+
         # 构建 metadata
         color_w, color_h = self.combo_color_res.currentData()
         depth_w, depth_h = self.combo_depth_res.currentData()
@@ -348,11 +412,31 @@ class MainWindow(QMainWindow):
             })
             self._log("[WARN] 未能获取相机内参，元数据中将写入 null")
 
-        result = save_frame_data(save_dir, prefix, self._current_frames, metadata)
+        result = save_frame_data(save_dir, prefix, self._current_frames,
+                                 metadata, save_options)
         if result:
-            self._log(f"已保存: {os.path.basename(result['meta_json'])}")
+            self._log(f"已保存 {len(result)} 项: {os.path.basename(save_dir)}")
         else:
             self._log("[ERROR] 保存失败")
+
+    # ------------------------------------------------------------------
+    # 保存项选择
+    # ------------------------------------------------------------------
+
+    def _get_save_options(self):
+        """从复选框状态构建保存项选择字典。"""
+        return {
+            key: cb.isChecked()
+            for key, cb in self._save_checkboxes.items()
+        }
+
+    def _on_select_all_save(self):
+        for cb in self._save_checkboxes.values():
+            cb.setChecked(True)
+
+    def _on_deselect_all_save(self):
+        for cb in self._save_checkboxes.values():
+            cb.setChecked(False)
 
     # ------------------------------------------------------------------
     # 关闭窗口
@@ -362,5 +446,6 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         if self.camera and self.camera.is_running():
             self.camera.stop()
+        self.calib_tab.notify_camera_stopped()
         self._log("程序退出。")
         event.accept()
