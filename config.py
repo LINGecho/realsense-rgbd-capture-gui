@@ -69,3 +69,16 @@ DEFAULT_DEPTH_SCALE = 0.001           # RealSense D4xx 默认深度单位 (m)
 DEFAULT_FUSION_VOXEL_SIZE = 0.003     # 体素下采样大小 (m)
 DEFAULT_FUSION_DISTANCE_MAX = 2.0     # 最远距离过滤 (m)
 DEFAULT_FUSION_POINT_SKIP = 4         # 每隔 N 个像素取一个点（加速）
+
+# Mask 高亮颜色调色板（RGB 0-1 范围，用于 Open3D 点云显示）
+# 每个 mask 按发现顺序依次分配颜色
+MASK_HIGHLIGHT_COLORS = [
+    (1.0, 0.15, 0.15),     # 亮红
+    (0.15, 1.0, 0.15),     # 亮绿
+    (1.0, 1.0, 0.15),      # 亮黄
+    (0.15, 1.0, 1.0),      # 亮青
+    (1.0, 0.15, 1.0),      # 亮品红
+    (0.15, 0.50, 1.0),     # 亮蓝
+    (1.0, 0.55, 0.15),     # 亮橙
+    (0.55, 0.15, 1.0),     # 亮紫
+]

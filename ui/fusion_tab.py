@@ -125,6 +125,14 @@ class FusionTab(QWidget):
         self.spin_skip.setValue(config.DEFAULT_FUSION_POINT_SKIP)
         layout.addWidget(self.spin_skip, 2, 1)
 
+        # Mask 开关
+        self.chk_mask = QCheckBox("启用 Mask 高亮")
+        self.chk_mask.setToolTip(
+            "开启后自动查找各采集目录下的 *_mask.png / *_mask.jpg，"
+            "将 mask 区域用高亮颜色显示"
+        )
+        layout.addWidget(self.chk_mask, 3, 0, 1, 2)
+
         return group
 
     def _create_action_panel(self):
@@ -225,14 +233,30 @@ class FusionTab(QWidget):
         voxel = self.spin_voxel.value()
         skip = self.spin_skip.value()
         dist = self.spin_dist.value()
+        mask_on = self.chk_mask.isChecked()
+
+        mask_info = ""
+        if mask_on:
+            mask_names = set()
+            for cap in selected:
+                for mname in cap.get("masks", {}):
+                    mask_names.add(mname)
+            if mask_names:
+                mask_info = f", mask={{{', '.join(sorted(mask_names))}}}"
+            else:
+                mask_info = ", mask=无(未找到mask图像)"
 
         self._log(
             f"开始融合 {len(selected)} 个视角: "
-            f"voxel={voxel}m, skip={skip}, dist_max={dist}m"
+            f"voxel={voxel}m, skip={skip}, dist_max={dist}m{mask_info}"
         )
 
         try:
-            self._pcd = fuse_captures(selected, voxel, skip, dist)
+            self._pcd = fuse_captures(
+                selected, voxel, skip, dist,
+                mask_enabled=mask_on,
+                mask_colors=config.MASK_HIGHLIGHT_COLORS,
+            )
         except Exception as e:
             self._log(f"[ERROR] 融合失败: {e}")
             QMessageBox.critical(self, "融合失败", str(e))

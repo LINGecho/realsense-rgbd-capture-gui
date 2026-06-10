@@ -15,13 +15,37 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _scan_masks(cap_dir: str) -> dict[str, str]:
+    """扫描目录下的 mask 图像文件。
+
+    匹配格式: <name>_mask.png 或 <name>_mask.jpg，
+    例如 cup_mask.png → {"cup": "/path/to/cup_mask.png"}
+
+    Returns:
+        dict[mask_name, mask_path]
+    """
+    masks = {}
+    if not os.path.isdir(cap_dir):
+        return masks
+    for fname in sorted(os.listdir(cap_dir)):
+        base, ext = os.path.splitext(fname.lower())
+        if ext not in (".png", ".jpg", ".jpeg"):
+            continue
+        if not base.endswith("_mask"):
+            continue
+        name = base[:-5]  # 去掉 "_mask" 后缀
+        if name:
+            masks[name] = os.path.join(cap_dir, fname)
+    return masks
+
+
 def load_capture_from_dir(cap_dir: str) -> dict | None:
     """从标定采集目录加载数据。
 
     Returns:
         dict 或 None:
             timestamp, board_params, intrinsics, success,
-            rvec, tvec, depth_scale, rgb_path, depth_npy_path
+            rvec, tvec, depth_scale, rgb_path, depth_npy_path, masks
     """
     pose_file = os.path.join(cap_dir, "pose.json")
     rgb_file = os.path.join(cap_dir, "rgb.png")
@@ -48,6 +72,8 @@ def load_capture_from_dir(cap_dir: str) -> dict | None:
     tvec = np.array(pose_data["tvec"], dtype=np.float32).reshape(3, 1)
     depth_scale = pose_data.get("depth_scale", 0.001)
 
+    masks = _scan_masks(cap_dir)
+
     return {
         "name": os.path.basename(cap_dir),
         "timestamp": pose_data.get("timestamp", ""),
@@ -59,6 +85,7 @@ def load_capture_from_dir(cap_dir: str) -> dict | None:
         "depth_path": depth_file,
         "num_corners": pose_data.get("num_corners", 0),
         "reproj_error": pose_data.get("reproj_error_px", None),
+        "masks": masks,
     }
 
 
@@ -89,8 +116,9 @@ def depth_to_point_cloud(depth_map: np.ndarray,
                          intrinsics: dict,
                          depth_scale: float,
                          point_skip: int = 4,
-                         distance_max: float = 2.0
-                         ) -> tuple[np.ndarray, np.ndarray]:
+                         distance_max: float = 2.0,
+                         masks: dict[str, np.ndarray] | None = None
+                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """将深度图反投影为相机坐标系下的 3D 点云。
 
     Args:
@@ -100,9 +128,12 @@ def depth_to_point_cloud(depth_map: np.ndarray,
         depth_scale: 深度单位 (RealSense 默认 0.001)
         point_skip: 每隔 N 个像素取一个点
         distance_max: 最远距离 (m)，超过的不取
+        masks: 可选，{name: binary_mask_uint8(H,W)} 255=物体
 
     Returns:
-        (points_cam, colors): points_cam (N,3), colors (N,3) BGR
+        (points_cam, colors, mask_ids):
+            points_cam (N,3), colors (N,3) BGR,
+            mask_ids (N,) int32 或 None: -1=无mask, 0/1/2...=mask索引
     """
     fx = intrinsics["fx"]
     fy = intrinsics["fy"]
@@ -138,7 +169,7 @@ def depth_to_point_cloud(depth_map: np.ndarray,
             f"深度反投影无有效点: 总={n_total}, 无效={n_invalid}, "
             f"超出距离={n_too_far}, 非零深度范围=[{z_raw[z_raw>0].min():.3f},{z_raw[z_raw>0].max():.3f}]m"
         )
-        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32), None
 
     logger.debug(
         f"深度反投影: 总={n_total}, 有效={n_valid}, "
@@ -155,7 +186,24 @@ def depth_to_point_cloud(depth_map: np.ndarray,
     # 取对应颜色 (BGR)
     colors = color_image[vv, uu].astype(np.float32) / 255.0  # (N, 3)
 
-    return points_cam, colors
+    # 计算 mask 归属
+    mask_ids = None
+    if masks:
+        mask_ids = np.full(n_valid, -1, dtype=np.int32)
+        for i, (mask_name, mask_img) in enumerate(masks.items()):
+            if mask_img.shape[:2] != (h, w):
+                logger.warning(
+                    f"Mask '{mask_name}' 尺寸 {mask_img.shape[:2]} "
+                    f"与图像 ({h},{w}) 不匹配，跳过"
+                )
+                continue
+            # 取采样像素处的 mask 值 (>127 视为前景)
+            mask_vals = mask_img[vv, uu]
+            hit = mask_vals > 127
+            # 仅对尚未分配 mask 的点赋值（先匹配的优先）
+            mask_ids[(mask_ids < 0) & hit] = i
+
+    return points_cam, colors, mask_ids
 
 
 def transform_to_board(points_cam: np.ndarray, rvec: np.ndarray,
@@ -186,9 +234,15 @@ def transform_to_board(points_cam: np.ndarray, rvec: np.ndarray,
 def fuse_captures(captures: list[dict],
                   voxel_size: float = 0.003,
                   point_skip: int = 4,
-                  distance_max: float = 2.0
+                  distance_max: float = 2.0,
+                  mask_enabled: bool = False,
+                  mask_colors: list[tuple[float, float, float]] | None = None
                   ) -> "open3d.geometry.PointCloud | None":
     """将多个采集融合为单个体素下采样点云。
+
+    Args:
+        mask_enabled: 是否启用 mask 高亮
+        mask_colors: mask 高亮颜色列表 (RGB 0-1)，按分配顺序使用
 
     Returns:
         open3d.geometry.PointCloud 或 None
@@ -198,6 +252,16 @@ def fuse_captures(captures: list[dict],
     except ImportError:
         logger.error("open3d 未安装，请执行: pip install open3d")
         return None
+
+    # 第一遍：发现所有 mask 名称，建立全局索引
+    mask_name_to_idx: dict[str, int] = {}
+    mask_names_all: list[str] = []
+    if mask_enabled:
+        for cap in captures:
+            for mname in sorted(cap.get("masks", {}).keys()):
+                if mname not in mask_name_to_idx:
+                    mask_name_to_idx[mname] = len(mask_name_to_idx)
+                    mask_names_all.append(mname)
 
     all_points = []
     all_colors = []
@@ -210,15 +274,55 @@ def fuse_captures(captures: list[dict],
             logger.warning(f"无法读取 {cap['rgb_path']}，跳过")
             continue
 
+        # 准备 masks（按全局名称顺序加载，缺失的跳过）
+        masks_loaded = None
+        if mask_enabled and cap.get("masks") and mask_names_all:
+            masks_loaded = {}
+            for mname in mask_names_all:  # 按全局顺序
+                mpath = cap["masks"].get(mname)
+                if mpath is None:
+                    continue
+                mask_img = cv2.imread(mpath, cv2.IMREAD_GRAYSCALE)
+                if mask_img is None:
+                    logger.warning(f"无法读取 mask: {mpath}")
+                    continue
+                masks_loaded[mname] = mask_img
+
         # 反投影到相机坐标系
-        pts_cam, cols = depth_to_point_cloud(
+        pts_cam, cols, mask_ids = depth_to_point_cloud(
             depth, color, cap["intrinsics"],
             cap["depth_scale"], point_skip, distance_max,
+            masks=masks_loaded if mask_enabled else None,
         )
 
         if len(pts_cam) == 0:
             logger.warning(f"{cap['name']}: 无有效深度点，跳过")
             continue
+
+        # 应用 mask 高亮颜色
+        if mask_ids is not None and len(mask_names_all) > 0:
+            # 重映射本地索引 → 全局索引
+            local_names = list(masks_loaded.keys())
+            local_to_global = np.array(
+                [mask_name_to_idx.get(n, -1) for n in local_names],
+                dtype=np.int32,
+            )
+            remapped = np.full_like(mask_ids, -1)
+            for li, gi in enumerate(local_to_global):
+                if gi >= 0:
+                    remapped[mask_ids == li] = gi
+            mask_ids = remapped
+
+            # 上色
+            default_colors = mask_colors or [
+                (1.0, 0.15, 0.15),  # 默认亮红
+            ]
+            for gi, mname in enumerate(mask_names_all):
+                color_idx = gi % len(default_colors)
+                hl = default_colors[color_idx]
+                hl_bgr = (hl[2], hl[1], hl[0])  # RGB → BGR
+                hit = mask_ids == gi
+                cols[hit] = np.array(hl_bgr, dtype=np.float32)
 
         # 变换到标定板坐标系
         pts_board = transform_to_board(pts_cam, cap["rvec"], cap["tvec"])
@@ -226,11 +330,20 @@ def fuse_captures(captures: list[dict],
         all_points.append(pts_board)
         all_colors.append(cols)
 
+        mask_info = ""
+        if mask_ids is not None:
+            mask_counts = ", ".join(
+                f"{mask_names_all[gi]}={(mask_ids == gi).sum()}"
+                for gi in range(len(mask_names_all))
+                if (mask_ids == gi).any()
+            )
+            mask_info = f", mask点: [{mask_counts}]"
         logger.info(
             f"  {cap['name']}: {len(pts_board)} 个点, "
             f"板坐标范围 [{pts_board[:,0].min():.2f},{pts_board[:,0].max():.2f}] "
             f"[{pts_board[:,1].min():.2f},{pts_board[:,1].max():.2f}] "
             f"[{pts_board[:,2].min():.2f},{pts_board[:,2].max():.2f}]"
+            f"{mask_info}"
         )
 
     if not all_points:
@@ -244,6 +357,8 @@ def fuse_captures(captures: list[dict],
     logger.info(
         f"融合点云: {merged_pts.shape[0]} 个点 (来自 {len(all_points)} 个视角)"
     )
+    if mask_enabled and mask_names_all:
+        logger.info(f"Mask 对象: {', '.join(mask_names_all)}")
 
     # 构建 Open3D 点云
     pcd = o3d.geometry.PointCloud()
